@@ -610,10 +610,12 @@ class UsageOutcome:
     ``rescued_from`` names the ``_classify_usage_error`` kind a fallback source
     recovered this measurement from, set only alongside ``error=None``: the
     data really is good, but the failure it routed around still happened and
-    downstream state must not be told otherwise. Today only ``"http-429"``
-    (see :func:`_probe_fallback`), whose consumer is the poll cadence floor:
-    without it the rescue unlocks fast polling on exactly the accounts whose
-    usage endpoint is already saturated.
+    downstream state must not be told otherwise. One of ``_PROBEABLE_ERRORS``
+    (see :func:`_probe_fallback`). Its consumer is the poll cadence floor,
+    which keys on ``"http-429"`` specifically: without it the rescue unlocks
+    fast polling on exactly the accounts whose usage endpoint is already
+    saturated. A rescued ``"http-403"`` is deliberately not that -- nothing
+    is saturated -- so it paces like any other success.
     """
 
     usage: dict | None
@@ -637,6 +639,17 @@ def fetch_usage(access_token: str) -> dict | None:
         return None
 
 
+# Usage-endpoint failures the header probe can answer. A 429 means the
+# endpoint's own per-account budget is spent. A 403 means this credential is
+# not admitted there at all: setup-tokens are inference-only server-side, so
+# the profile endpoints refuse them (see switcher.SETUP_TOKEN_SCOPES) while
+# ``POST /v1/messages`` serves them normally. Both describe the endpoint
+# rather than the token's ability to run inference, so the probe can still
+# speak for the account. A 401 stays out -- a dead token is not healed by
+# spending quota -- and so does every 5xx, which describes the server.
+_PROBEABLE_ERRORS = frozenset({"http-429", "http-403"})
+
+
 def _probe_fallback(
     kind: str, access_token: str, enabled: bool = True
 ) -> UsageOutcome | None:
@@ -644,24 +657,32 @@ def _probe_fallback(
 
     ``GET /api/oauth/usage`` rate-limits per account on that account's own
     inference activity (issue #220), so a busy account can 429 there
-    indefinitely. ``unified_headers.probe_usage`` recovers the same
-    utilization from a throwaway completion's response headers, spending about
-    10 tokens of the account's own quota. Only a 429 justifies that spend, and
-    only a 429 could be healed by it: an auth failure means the token is dead,
-    which quota cannot fix. So callers pass the classified ``kind`` in, and
-    ``enabled`` carries the user's ``usage.headerFallback`` setting. None for
-    anything else, and None when the probe fails, so the caller falls through
-    to its own failure return instead of papering over the original error.
-    Shared by both 429 sites in :func:`try_fetch_usage_for_account`.
+    indefinitely; a setup-token account is refused with 403 there for good.
+    ``unified_headers.probe_usage`` recovers the same utilization from a
+    throwaway completion's response headers, spending about 10 tokens of the
+    account's own quota. Only a failure OF THE ENDPOINT justifies that spend
+    and could be healed by it -- see ``_PROBEABLE_ERRORS`` for which kinds
+    qualify and why an auth failure never does. So callers pass the classified
+    ``kind`` in, and ``enabled`` carries the user's ``usage.headerFallback``
+    setting. None for anything else, and None when the probe fails, so the
+    caller falls through to its own failure return instead of papering over
+    the original error. Shared by both fallback sites in
+    :func:`try_fetch_usage_for_account`.
 
     The outcome reports ``error=None`` (the data is real) but carries
     ``rescued_from=kind``, so state keyed on "did this token 429?" still sees
     the 429. Erasing it would hand the account back to the urgent poll
     cadence: the endpoint admits roughly 28-30 requests per hour per identity
     (see ``poll_policy``), a 429 means that budget is spent, and 60-second
-    polling re-spends it faster than it ages out.
+    polling re-spends it faster than it ages out. A rescued 403 carries its
+    own kind and so does NOT arm that floor, correctly: a scope refusal is
+    not a spent budget, and the endpoint will refuse the next poll just as
+    cheaply. What bounds the 403 probe instead is the probe's own honesty --
+    a token that cannot run inference gets no headers back (a 403 from
+    ``/v1/messages`` is never read for usage), so only an account that really
+    is alive keeps paying the 10 tokens.
     """
-    if kind != "http-429" or not enabled:
+    if kind not in _PROBEABLE_ERRORS or not enabled:
         return None
     probed = probe_usage(access_token)
     if probed is None:
@@ -692,14 +713,14 @@ def try_fetch_usage_for_account(
 
     Active accounts are never refreshed — Claude Code owns those credentials.
 
-    Both places a fetch here can 429 (the direct request, and the retry
-    after a 401-triggered refresh) route through :func:`_probe_fallback`,
-    which recovers busy-account usage from response headers instead of the
-    endpoint that just refused it. See that function's docstring for why
-    only a 429 qualifies and what a failed probe does. ``header_fallback``
-    carries the user's ``usage.headerFallback`` setting: False turns the
-    rescue off, and a 429 then reports as the failure it is, since the probe
-    spends the account's own subscription quota.
+    Both places a fetch here can be refused by the endpoint itself (the
+    direct request, and the retry after a 401-triggered refresh) route
+    through :func:`_probe_fallback`, which recovers the usage from response
+    headers instead of the endpoint that just refused it. See that function's
+    docstring for which kinds qualify and what a failed probe does.
+    ``header_fallback`` carries the user's ``usage.headerFallback`` setting:
+    False turns the rescue off, and the refusal then reports as the failure
+    it is, since the probe spends the account's own subscription quota.
     ``refresh_via(account_num, email, snapshot)`` supersedes the direct POST
     when given: the switcher passes its consume gate, which re-reads the
     freshest copy under the slot lock, persists via fingerprint CAS, and

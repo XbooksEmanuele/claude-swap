@@ -1047,11 +1047,13 @@ class TestTryFetchUsageOutcome:
 
 
 class TestUsageEndpointFallbackToHeaderProbe:
-    """A busy account's ``GET /api/oauth/usage`` 429s, but ``POST
-    /v1/messages`` rate-limits far more loosely (issue #220) and carries the
-    same utilization on its response headers. Only a 429 justifies spending
-    the probe's ~10 tokens of the account's own quota: an auth failure can't
-    be healed by spending quota, so it must never trigger this fallback."""
+    """A busy account's ``GET /api/oauth/usage`` 429s and a setup-token
+    account's 403s, but ``POST /v1/messages`` rate-limits far more loosely
+    (issue #220), admits inference-only scopes, and carries the same
+    utilization on its response headers. Only a refusal by that endpoint
+    justifies spending the probe's ~10 tokens of the account's own quota: an
+    auth failure can't be healed by spending quota, so it must never trigger
+    this fallback."""
 
     @staticmethod
     def _make_credentials() -> str:
@@ -1149,8 +1151,13 @@ class TestUsageEndpointFallbackToHeaderProbe:
         probe_mock.assert_not_called()
         assert outcome.error == "http-401"
 
-    def test_403_does_not_probe(self):
-        probe_mock = MagicMock()
+    def test_403_falls_back_to_header_probe(self):
+        """A setup-token account is inference-only server-side, so the usage
+        endpoint 403s it permanently while ``POST /v1/messages`` serves it
+        normally. That is the endpoint refusing the credential, not the
+        credential being dead, so the probe can still speak for the account
+        -- and here it is the only source that ever will."""
+        probe_mock = MagicMock(return_value={"five_hour": {"pct": 11.0}})
         with (
             patch("claude_swap.oauth.request_usage_data",
                   side_effect=self._http_error(403)),
@@ -1159,8 +1166,42 @@ class TestUsageEndpointFallbackToHeaderProbe:
             outcome = oauth.try_fetch_usage_for_account(
                 "1", "a@b.c", self._make_credentials(), is_active=False,
             )
-        probe_mock.assert_not_called()
+        assert outcome.error is None
+        assert outcome.usage["five_hour"]["pct"] == 11.0
+        assert outcome.usage["source"] == "headers"
+        probe_mock.assert_called_once_with("old-access")
+
+    def test_a_rescued_403_does_not_claim_a_429(self):
+        """``rescued_from`` records which refusal was routed around, and the
+        403 must keep its own identity: the cadence floor keys on
+        ``http-429`` to mean "endpoint budget spent", which a scope refusal
+        is not. Mislabelling it would park a healthy account at the post-429
+        cadence forever."""
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(403)),
+            patch("claude_swap.oauth.probe_usage",
+                  return_value={"five_hour": {"pct": 11.0}}),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
+        assert outcome.rescued_from == "http-403"
+
+    def test_a_403_whose_probe_also_fails_reports_the_403(self):
+        """The probe is the bound on 403 spend: a credential that cannot run
+        inference gets no headers back, so the original refusal stands
+        instead of being papered over."""
+        with (
+            patch("claude_swap.oauth.request_usage_data",
+                  side_effect=self._http_error(403)),
+            patch("claude_swap.oauth.probe_usage", return_value=None),
+        ):
+            outcome = oauth.try_fetch_usage_for_account(
+                "1", "a@b.c", self._make_credentials(), is_active=False,
+            )
         assert outcome.error == "http-403"
+        assert outcome.usage is None
 
     def test_the_fallback_can_be_switched_off(self):
         """``usage.headerFallback`` disabled: the 429 stands and no quota is
